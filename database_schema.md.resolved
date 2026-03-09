@@ -1,0 +1,312 @@
+# MindleapV1: Database Schema Architecture
+
+## 1. Overview & Enums
+
+The database follows a relational design, enforcing integrity with proper foreign keys and indexes.
+
+### Enums
+- **UserRole:** `STUDENT`, `COUNSELLOR`, `ADMIN`
+- **AppointmentStatus:** `PENDING`, `CONFIRMED`, `CANCELED`, `COMPLETED`
+- **ChatSessionStatus:** `ACTIVE`, `CLOSED`
+- **SeverityLevel:** `LOW`, `MODERATE`, `HIGH`, `CRITICAL`
+- **ResourceType:** `ARTICLE`, `VIDEO`, `AUDIO`
+- **AssessmentType:** `PHQ_9`, `GAD_7`, `CUSTOM`
+
+---
+
+## 2. Entity Relationship Diagram
+
+```mermaid
+erDiagram
+    Users ||--o{ Students : "is-a (1:1)"
+    Users ||--o{ Counsellors : "is-a (1:1)"
+    Departments ||--o{ Students : "has"
+    Departments ||--o{ Counsellors : "has"
+    
+    Students ||--o{ Appointments : "books"
+    Counsellors ||--o{ Appointments : "accepts"
+    Counsellors ||--o{ Availability : "defines"
+    
+    Students ||--o{ ChatSessions : "starts (AI)"
+    ChatSessions ||--o{ ChatMessages : "contains"
+    
+    Students ||--o{ PeerConversations : "participant 1"
+    Students ||--o{ PeerConversations : "participant 2"
+    PeerConversations ||--o{ PeerMessages : "contains"
+    
+    Assessments ||--o{ Questions : "has"
+    Questions ||--o{ Answers : "has options"
+    Students ||--o{ AssessmentResults : "takes"
+    Assessments ||--o{ AssessmentResultSummary : "summarizes"
+    AssessmentResultSummary ||--o{ AssessmentResults : "contains"
+    
+    Admins ||--o{ Resources : "manages"
+    Admins ||--o{ Announcements : "broadcasts"
+    Departments ||--o{ Announcements : "targets"
+```
+
+---
+
+## 3. Relationships & Indexes Explanation
+
+*   **Polymorphic identity via `Users` table:** Instead of completely duplicating authentication fields (email, password_hash) across Students and Counsellors, the `users` table holds core identity. `students` and `counsellors` act as extension tables (1-to-1) providing role-specific data using `user_id` as their primary key/foreign key.
+*   **Availability vs. Appointments:** A counselor defines blocks of time in `counsellor_availability`. `appointments` references the student and counselor, holding a specific timestamp. If an appointment is confirmed, the corresponding slot in `availability` is marked `is_booked = true`.
+*   **Self-Referencing & Composite Links (Peer-to-Peer):** `peer_conversations` holds `student1_id` and `student2_id`. To quickly look up a student's active chats, indexes are created on both columns.
+*   **Assessment Normalization:** To prevent data redundancy, we use:
+    1.  `assessments` (e.g., PHQ-9 details).
+    2.  `assessment_questions` (The 9 questions).
+    3.  `assessment_options` (The 4 standard answers with their score weights).
+    4.  `assessment_results` (The timestamped instance of a student taking it, containing total scores).
+    5.  `assessment_result_answers` (The specific choice the student made per question).
+
+### Critical Indexes
+1.  **Users:** Unique on `email`.
+2.  **Appointments:** `(counsellor_id, start_time)` and `(student_id, start_time)` for fast calendar rendering.
+3.  **Chat Messages / Peer Messages:** `(session_id, created_at DESC)` for loading chat history efficiently.
+4.  **Assessment Results:** `(student_id, created_at DESC)` for calculating mental health trajectories over time.
+
+---
+
+## 4. SQLAlchemy Models (Python / FastAPI)
+
+These models represent the >20 tables required for the platform.
+
+```python
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Enum, Text, Float, Table, UniqueConstraint, Index
+from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.sql import func
+import enum
+
+Base = declarative_base()
+
+# --- Enums ---
+class UserRole(enum.Enum):
+    STUDENT = "student"
+    COUNSELLOR = "counsellor"
+    ADMIN = "admin"
+
+class AppointmentStatus(enum.Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    CANCELED = "canceled"
+    COMPLETED = "completed"
+
+# --- Core Identity ---
+
+class Department(Base):
+    __tablename__ = "departments"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), unique=True, nullable=False)
+    description = Column(Text, nullable=True)
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    first_name = Column(String(50), nullable=False)
+    last_name = Column(String(50), nullable=False)
+    role = Column(Enum(UserRole), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relationships
+    student_profile = relationship("Student", back_populates="user", uselist=False)
+    counsellor_profile = relationship("Counsellor", back_populates="user", uselist=False)
+
+class Student(Base):
+    __tablename__ = "students"
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    student_id_number = Column(String(50), unique=True, nullable=False)
+    department_id = Column(Integer, ForeignKey("departments.id"))
+    enrollment_year = Column(Integer)
+    emergency_contact_phone = Column(String(20))
+    
+    user = relationship("User", back_populates="student_profile")
+    department = relationship("Department")
+    appointments = relationship("Appointment", back_populates="student")
+
+class Counsellor(Base):
+    __tablename__ = "counsellors"
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    department_id = Column(Integer, ForeignKey("departments.id"))
+    bio = Column(Text)
+    license_number = Column(String(100))
+    
+    user = relationship("User", back_populates="counsellor_profile")
+    department = relationship("Department")
+    availability = relationship("CounsellorAvailability", back_populates="counsellor")
+    appointments = relationship("Appointment", back_populates="counsellor")
+
+# --- Scheduling & Appointments ---
+
+class CounsellorAvailability(Base):
+    __tablename__ = "counsellor_availability"
+    id = Column(Integer, primary_key=True, index=True)
+    counsellor_id = Column(Integer, ForeignKey("counsellors.user_id", ondelete="CASCADE"))
+    start_time = Column(DateTime(timezone=True), nullable=False)
+    end_time = Column(DateTime(timezone=True), nullable=False)
+    is_booked = Column(Boolean, default=False)
+    
+    counsellor = relationship("Counsellor", back_populates="availability")
+
+    __table_args__ = (Index('idx_counsellor_time', 'counsellor_id', 'start_time'),)
+
+class Appointment(Base):
+    __tablename__ = "appointments"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.user_id", ondelete="CASCADE"))
+    counsellor_id = Column(Integer, ForeignKey("counsellors.user_id", ondelete="CASCADE"))
+    start_time = Column(DateTime(timezone=True), nullable=False)
+    end_time = Column(DateTime(timezone=True), nullable=False)
+    status = Column(Enum(AppointmentStatus), default=AppointmentStatus.PENDING)
+    notes = Column(Text)  # Counsellor private notes
+    meeting_link = Column(String(255)) # Zoom/Teams link
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    student = relationship("Student", back_populates="appointments")
+    counsellor = relationship("Counsellor", back_populates="appointments")
+
+    __table_args__ = (Index('idx_appt_student', 'student_id', 'start_time'),)
+
+# --- AI & Peer Chat System ---
+
+class ChatSession(Base):
+    """Conversations between a student and the AI."""
+    __tablename__ = "chat_sessions"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.user_id", ondelete="CASCADE"))
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    is_active = Column(Boolean, default=True)
+    topic_summary = Column(String(255))
+    
+    messages = relationship("ChatMessage", back_populates="session")
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"))
+    sender = Column(String(50)) # "user" or "ai"
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    session = relationship("ChatSession", back_populates="messages")
+    __table_args__ = (Index('idx_chat_session_time', 'session_id', 'created_at'),)
+
+class PeerConversation(Base):
+    """Anonymous or direct peer-to-peer messaging."""
+    __tablename__ = "peer_conversations"
+    id = Column(Integer, primary_key=True, index=True)
+    student1_id = Column(Integer, ForeignKey("students.user_id"))
+    student2_id = Column(Integer, ForeignKey("students.user_id"))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    messages = relationship("PeerMessage", back_populates="conversation")
+
+class PeerMessage(Base):
+    __tablename__ = "peer_messages"
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("peer_conversations.id", ondelete="CASCADE"))
+    sender_id = Column(Integer, ForeignKey("students.user_id"))
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    conversation = relationship("PeerConversation", back_populates="messages")
+
+# --- Assessments & Quizzes ---
+
+class Assessment(Base):
+    __tablename__ = "assessments"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False) # e.g., "PHQ-9 Depression Scale"
+    description = Column(Text)
+    
+    questions = relationship("Question", back_populates="assessment")
+
+class Question(Base):
+    __tablename__ = "assessment_questions"
+    id = Column(Integer, primary_key=True, index=True)
+    assessment_id = Column(Integer, ForeignKey("assessments.id", ondelete="CASCADE"))
+    order_num = Column(Integer, nullable=False)
+    text = Column(Text, nullable=False)
+    
+    assessment = relationship("Assessment", back_populates="questions")
+    answers = relationship("AnswerOption", back_populates="question")
+
+class AnswerOption(Base):
+    __tablename__ = "assessment_options"
+    id = Column(Integer, primary_key=True, index=True)
+    question_id = Column(Integer, ForeignKey("assessment_questions.id", ondelete="CASCADE"))
+    text = Column(String(255), nullable=False)
+    score_weight = Column(Integer, nullable=False) # e.g., 0, 1, 2, 3
+    
+    question = relationship("Question", back_populates="answers")
+
+class AssessmentResult(Base):
+    """The overarching result of a student taking a specific assessment."""
+    __tablename__ = "assessment_results"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.user_id", ondelete="CASCADE"))
+    assessment_id = Column(Integer, ForeignKey("assessments.id", ondelete="CASCADE"))
+    total_score = Column(Integer, nullable=False)
+    severity = Column(Enum(SeverityLevel), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    details = relationship("AssessmentResultDetail", back_populates="result")
+
+class AssessmentResultDetail(Base):
+    """The individual answers chosen during that assessment instance."""
+    __tablename__ = "assessment_result_details"
+    id = Column(Integer, primary_key=True, index=True)
+    result_id = Column(Integer, ForeignKey("assessment_results.id", ondelete="CASCADE"))
+    question_id = Column(Integer, ForeignKey("assessment_questions.id"))
+    selected_option_id = Column(Integer, ForeignKey("assessment_options.id"))
+    
+    result = relationship("AssessmentResult", back_populates="details")
+
+# --- Content & Announcements ---
+
+class ResourceCategory(Base):
+    __tablename__ = "resource_categories"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), unique=True, nullable=False)
+
+class Resource(Base):
+    __tablename__ = "resources"
+    id = Column(Integer, primary_key=True, index=True)
+    category_id = Column(Integer, ForeignKey("resource_categories.id"))
+    title = Column(String(255), nullable=False)
+    content_url = Column(String(500), nullable=False)
+    type = Column(Enum(ResourceType), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Announcement(Base):
+    __tablename__ = "announcements"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    body = Column(Text, nullable=False)
+    target_department_id = Column(Integer, ForeignKey("departments.id"), nullable=True) # Null = All students
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+
+# --- Tracking ---
+
+class DailyMoodLog(Base):
+    __tablename__ = "daily_mood_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.user_id", ondelete="CASCADE"))
+    mood_score = Column(Integer, nullable=False) # 1 (terrible) to 5 (great)
+    journal_entry = Column(Text, nullable=True)
+    logged_date = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint('student_id', 'logged_date', name='uix_student_date'),)
+
+class CrisisAlert(Base):
+    __tablename__ = "crisis_alerts"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.user_id", ondelete="CASCADE"))
+    trigger_source = Column(String(50)) # 'chatbot', 'assessment', 'manual'
+    status = Column(String(50), default='open') # 'open', 'resolved'
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+```

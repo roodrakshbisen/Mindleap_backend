@@ -1,0 +1,169 @@
+# MindleapV1: University Mental Health Platform Architecture
+
+## 1. System Architecture
+
+The architecture relies on a modern, asynchronous FastAPI backend suited for high concurrency and real-time features.
+
+```mermaid
+graph TD
+    %% Clients
+    Browser[Web Browser / React] -->|HTTPS / WSS| Nginx[API Gateway / Nginx / Traefik]
+    MobileApp[Mobile App / React Native] -->|HTTPS / WSS| Nginx
+    
+    %% Gateway
+    Nginx --> FastAPI_App[FastAPI Core Application]
+    
+    %% Core Services / Modules
+    subgraph FastAPI Monolithic Micro-Modules
+        Auth[Auth & Identity Module]
+        Chatbot[AI Chatbot & WebSocket Module]
+        Appointments[Scheduling & Counseling Module]
+        Analytics[Telemetry & Analytics Module]
+        Resources[Content & Resources Module]
+    end
+    
+    FastAPI_App --> Auth
+    FastAPI_App --> Chatbot
+    FastAPI_App --> Appointments
+    FastAPI_App --> Analytics
+    FastAPI_App --> Resources
+    
+    %% Databases & Integrations
+    Auth --> PostgreSQL[(PostgreSQL - Relational DB)]
+    Appointments --> PostgreSQL
+    Resources --> PostgreSQL
+    
+    Analytics --> ClickHouse[(ClickHouse / TimescaleDB - Analytics)]
+    
+    %% Cache, Message Broker, and Background Workers
+    Chatbot --> Redis[(Redis Cache & Session Broker)]
+    Appointments --> Redis
+    
+    Redis -.-> |Task Queues| CeleryWorkers[Celery Workers]
+    
+    CeleryWorkers --> |Async Processing| PostgreSQL
+    CeleryWorkers --> |Email Notifications| SMTP[SMTP / SendGrid]
+    
+    %% External Services
+    Chatbot --> |LLM Inference API| OpenAILLM[External LLM Provider - OpenAI / Local LLaMA]
+```
+
+---
+
+## 2. Production Project Structure
+
+A domain-driven design (DDD) structure is used to maintain separation of concerns, allowing specific modules to be broken out into microservices if needed later.
+
+```text
+mindleap_backend/
+├── alembic/                    # Database migrations
+├── app/
+│   ├── main.py                 # FastAPI application factory and entry point
+│   ├── core/                   # Application-wide settings and configurations
+│   │   ├── config.py           # Pydantic BaseSettings for env vars
+│   │   ├── security.py         # JWT, password hashing
+│   │   ├── exceptions.py       # Global exception handlers
+│   │   └── celery_app.py       # Celery application initialization
+│   ├── api/                    # API Routing
+│   │   ├── dependencies.py     # Reusable dependencies (get_db, current_user)
+│   │   └── v1/
+│   │       ├── api_router.py   # FastAPI APIRouter aggregator
+│   │       └── ...
+│   ├── modules/                # Domain specific business logic (Micro-modules)
+│   │   ├── auth/               # Authentication and identity
+│   │   │   ├── models.py       # SQLAlchemy ORM models
+│   │   │   ├── schemas.py      # Pydantic validation schemas
+│   │   │   ├── services.py     # Business logic
+│   │   │   ├── router.py       # FastAPI endpoints
+│   │   │   └── tasks.py        # Celery background tasks (e.g., welcome email)
+│   │   ├── chatbot/            # GenAI chat and conversation memory
+│   │   ├── appointments/       # Counselor scheduling
+│   │   ├── analytics/          # Platform telemetry
+│   │   └── resources/          # Mental health content delivery
+│   ├── db/                     # Global Database utilities
+│   │   ├── session.py          # SQLAlchemy async engine Setup
+│   │   └── base.py             # Declarative base
+│   └── websockets/             # WebSocket connection managers
+│       └── connection_manager.py
+├── tests/                      # Pytest suite (unit and integration)
+├── scripts/                    # Helper scripts (db setup, seed data)
+├── docker-compose.yml          # Local development stack
+├── docker-compose.prod.yml     # Production scaling stack
+├── Dockerfile                  # Multi-stage Dockerfile for FastAPI
+├── Dockerfile.celery           # Dockerfile for Celery worker
+├── requirements.txt            # Poetry or pip dependencies
+└── README.md
+```
+
+---
+
+## 3. Microservice Module Explanation
+
+While initially deployed as a modular monolith for operational simplicity, the codebase is structured around independent "Micro-Modules" that can be easily extracted into separate microservices.
+
+*   **Auth & Identity Module:** Handles JWT-based authentication, user signup/login, password resets, and role-based access control (RBAC) distinguishing between Students, Counselors, and Admins.
+*   **Chatbot Module:** Manages interaction with the LLM (e.g., OpenAI, Langchain). It encapsulates conversation history state, prompt engineering specific to mental health (ensuring empathetic, safe boundaries), and WebSocket streaming logic.
+*   **Appointments (Scheduling) Module:** Manages the calendar system, booking counselor appointments, and managing availability. It relies heavily on Celery for sending out upcoming session reminders via email/SMS.
+*   **Analytics Module:** Handles high-throughput, non-blocking telemetry. It tracks anonymized user engagement, mood symptom ratings over time, and generic platform usage.
+*   **Resources Module:** Serves reading materials, breathing exercises, and static content metadata regarding mental health.
+
+---
+
+## 4. Infrastructure & Integration Design
+
+### 4.1 Docker Architecture
+
+*   **API Container:** Runs the FastAPI application using `uvicorn` with asynchronous workers. Built using a lightweight Python footprint (`python:3.11-slim`).
+*   **Celery Worker Container:** Executes background tasks to keep the API responsive. Shares the same core Python environment as the API but runs the Celery worker entry point (`celery -A app.core.celery_app worker`).
+*   **PostgreSQL Container:** Persistent structured data storage.
+*   **Redis Container:** Functions as the Celery task broker, a fast key-value cache, and temporal session store for WebSockets.
+*   *(Prod Only) Nginx/Traefik Container:* Acts as a reverse proxy, SSL termination point, and load balancer.
+
+### 4.2 Redis & Celery Integration Plan
+
+When a user performs an action that triggers a slow operation (like sending an email, generating an intensive report, or scraping new LLM context data), FastAPI enqueues the task via Redis.
+*   **Redis** acts as the message broker. It is also used independently by FastAPI for rate limiting API access and caching repeated heavy queries (e.g., daily schedule fetching).
+*   **Celery Workers** continuously monitor the Redis queues, pick up background tasks, execute them asynchronously, and write the state back to PostgreSQL or Redis without blocking the main event loop of FastAPI.
+
+### 4.3 WebSocket Architecture
+
+Real-time capabilities are critical for the Chatbot and potentially live counselor chatting.
+*   **Connection Manager (`app/websockets/connection_manager.py`):** An in-memory/Redis-backed dictionary tracking active WebSocket connections.
+*   **Authentication:** The WebSocket endpoint first authenticates the initial HTTP handshake using dependency injection (evaluating the user's JWT token).
+*   **State Distribution:** Because multiple FastAPI instances will run in production, Redis Pub/Sub will be used. If User A connects to Instance 1 and Counselor B connects to Instance 2, messages are published to a Redis channel and broadcast to the appropriate node.
+
+### 4.4 Chatbot Pipeline Architecture
+
+The AI Mental Health companion must be highly responsive and safe.
+
+```mermaid
+sequenceDiagram
+    actor Student
+    participant WSEndpoint as WebSocket Route
+    participant ChatService as Chatbot Module
+    participant Redis as Redis (Session Context)
+    participant LLM as Langchain / LLM Provider
+    participant DB as PostgreSQL
+
+    Student->>WSEndpoint: 1. Send Message via WS
+    WSEndpoint->>ChatService: 2. Route payload
+    ChatService->>Redis: 3. Fetch past N conversation turns
+    ChatService->>LLM: 4. Construct Prompt (System Rules + Context + Message)
+    LLM-->>ChatService: 5. Stream response tokens
+    ChatService-->>WSEndpoint: 6. Stream tokens to client
+    WSEndpoint-->>Student: 7. Real-time UI update
+    
+    %% Async cleanup
+    Note right of ChatService: After response completes
+    ChatService-)Redis: 8. Update active conversation cache
+    ChatService-)DB: 9. Background save to persistent DB (Async)
+```
+
+**Guardrails:** The pipeline includes a lightweight pre-evaluation layer. If a message contains trigger words indicating severe crisis (e.g., self-harm), it bypasses the LLM and instantly replies with emergency contacts and triggers an alert to university counselors via Celery.
+
+### 4.5 Analytics System Design
+
+System metrics must not hinder the performance of core platform features.
+*   **Event Emitting:** The platform utilizes FastAPI BackgroundTasks or a fast message queue (Kafka or Redis Streams) to log events rather than writing directly to PostgreSQL.
+*   **Aggregation:** A cron-driven Celery task runs nightly to aggregate engagement metrics (e.g., total active users, stress-topic frequency, average session lengths) and compiles a dashboard view for university administrators.
+*   **Anonymization:** Data stored in the analytics warehouse strips PII (Personally Identifiable Information) early in the pipeline to comply with student privacy laws (FERPA/HIPAA equivalents).
