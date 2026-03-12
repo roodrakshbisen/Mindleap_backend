@@ -32,7 +32,7 @@ class Appointment(Base):
     start_time = Column(DateTime(timezone=True), nullable=False)
     end_time = Column(DateTime(timezone=True), nullable=False)
     
-    status = Column(Enum(AppointmentStatus), default=AppointmentStatus.PENDING, index=True)
+    status = Column(Enum(AppointmentStatus, name="appointmentstatus", native_enum=True), default=AppointmentStatus.PENDING, index=True)
     
     # Counsellor's private notes after the session
     counsellor_notes = Column(Text, nullable=True)

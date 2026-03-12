@@ -45,7 +45,7 @@ class AssessmentResult(Base):
     student_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
     assessment_id = Column(Integer, ForeignKey("assessments.id", ondelete="CASCADE"), index=True)
     total_score = Column(Integer, nullable=False)
-    severity = Column(Enum(SeverityLevel), nullable=True)
+    severity = Column(Enum(SeverityLevel, name="severitylevel", native_enum=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     details = relationship("AssessmentResultDetail", back_populates="result", cascade="all, delete-orphan")
